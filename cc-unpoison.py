@@ -80,39 +80,57 @@ def parse_lines(raw):
     return recs
 
 
-def is_poison(d):
+def poison_msg_ids(recs):
+    """message.id of assistant turns that claim stop_reason=tool_use yet carry no tool_use
+    block across ALL their streamed sub-records. Claude Code splits one turn into separate
+    thinking / text / tool_use lines that share a message.id, so an unparsed tool call must
+    be judged per-turn — a lone thinking line is NOT poison if a sibling line holds the
+    tool_use. Judging per-record would flag every normal multi-block turn's thinking/text."""
+    has_tool_use = set()
+    claims = set()
+    for d in recs:
+        if d is None or d.get("type") != "assistant":
+            continue
+        msg = d.get("message") or {}
+        mid = msg.get("id")
+        if mid is None:
+            continue
+        blocks = msg.get("content") if isinstance(msg.get("content"), list) else []
+        if any(isinstance(b, dict) and b.get("type") == "tool_use" for b in blocks):
+            has_tool_use.add(mid)
+        if msg.get("stop_reason") == "tool_use":
+            claims.add(mid)
+    return claims - has_tool_use
+
+
+def is_poison(d, poison_ids):
     """Parse-poison signature: the malformed-tool-call retry hint, or an assistant turn
-    that claims stop_reason=tool_use but carries no tool_use block. Narrower than is_bad —
-    used to detect poison buried *before* the leaf, where a plain API-error line must NOT
-    trigger a false mid-conversation abort."""
+    whose message.id is in poison_ids (claimed a tool call but emitted no tool_use block)."""
     if d is None:
         return False
     msg = d.get("message") or {}
     typ = d.get("type")
-    content = msg.get("content")
+    if typ == "assistant":
+        return msg.get("id") in poison_ids
     if typ == "user" and d.get("isMeta"):
+        content = msg.get("content")
         if isinstance(content, str):
             txt = content
         elif isinstance(content, list):
             txt = " ".join(b.get("text", "") for b in content if isinstance(b, dict))
         else:
             txt = ""
-        if RETRY_HINT in txt:
-            return True
-    if typ == "assistant" and msg.get("stop_reason") == "tool_use":
-        blocks = content if isinstance(content, list) else []
-        if not any(isinstance(b, dict) and b.get("type") == "tool_use" for b in blocks):
-            return True
+        return RETRY_HINT in txt
     return False
 
 
-def is_bad(d):
+def is_bad(d, poison_ids):
     if d is None:
         return False
     msg = d.get("message") or {}
     if msg.get("model") == "<synthetic>" or d.get("isApiErrorMessage"):
         return True
-    return is_poison(d)
+    return is_poison(d, poison_ids)
 
 
 def is_clean_leaf(d):
@@ -180,8 +198,9 @@ def main():
     if not conv_idx:
         sys.exit(f"{path.name}: no conversation messages")
 
+    poison_ids = poison_msg_ids(recs)
     last = recs[conv_idx[-1]]
-    tail_bad = any(is_bad(recs[i]) for i in conv_idx[-6:]) or (
+    tail_bad = any(is_bad(recs[i], poison_ids) for i in conv_idx[-6:]) or (
         FATAL_TEXT in json.dumps(last.get("message", {}).get("content", ""))
     )
     if not tail_bad:
@@ -190,7 +209,7 @@ def main():
 
     leaf_pos = None
     for i in reversed(conv_idx):
-        if is_bad(recs[i]):
+        if is_bad(recs[i], poison_ids):
             continue
         if is_clean_leaf(recs[i]):
             leaf_pos = i
@@ -198,7 +217,7 @@ def main():
     if leaf_pos is None:
         sys.exit("no clean leaf found (whole tail is bad?) — use /compact instead.")
 
-    buried = next((i for i in conv_idx if i < leaf_pos and is_poison(recs[i])), None)
+    buried = next((i for i in conv_idx if i < leaf_pos and is_poison(recs[i], poison_ids)), None)
     if buried is not None:
         sys.exit(
             f"{path.name}: poison at L{buried + 1} is buried before the last clean turn "
