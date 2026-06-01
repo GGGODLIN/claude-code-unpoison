@@ -23,6 +23,7 @@ Usage:
   modified session under the project dir for the current working directory.
 """
 import argparse
+import glob
 import json
 import os
 import sys
@@ -44,28 +45,65 @@ def resolve_session(arg):
         p = Path(arg)
         if p.is_file():
             return p
-        hits = list(PROJECTS.glob(f"**/{arg}.jsonl"))
+        hits = list(PROJECTS.glob(f"**/{glob.escape(arg)}.jsonl"))
         if hits:
             return max(hits, key=lambda f: f.stat().st_mtime)
         sys.exit(f"session not found: {arg}")
     proj = PROJECTS / encode_cwd(Path.cwd())
-    pool = list(proj.glob("*.jsonl")) if proj.is_dir() else list(PROJECTS.glob("**/*.jsonl"))
+    if proj.is_dir():
+        pool = list(proj.glob("*.jsonl"))
+        if not pool:
+            sys.exit(f"no session jsonl in {proj}")
+        return max(pool, key=lambda f: f.stat().st_mtime)
+    pool = list(PROJECTS.glob("**/*.jsonl"))
     if not pool:
         sys.exit("no session jsonl found")
-    return max(pool, key=lambda f: f.stat().st_mtime)
+    chosen = max(pool, key=lambda f: f.stat().st_mtime)
+    print(
+        f"warning: no project dir for {Path.cwd()};\n"
+        f"  falling back to newest session across ALL projects:\n  {chosen}",
+        file=sys.stderr,
+    )
+    return chosen
 
 
-def parse_lines(path):
+def parse_lines(raw):
     recs = []
-    for raw in path.read_text().splitlines():
-        if not raw.strip():
+    for line in raw.split("\n"):
+        if not line.strip():
             recs.append(None)
             continue
         try:
-            recs.append(json.loads(raw))
+            recs.append(json.loads(line))
         except json.JSONDecodeError:
             recs.append(None)
     return recs
+
+
+def is_poison(d):
+    """Parse-poison signature: the malformed-tool-call retry hint, or an assistant turn
+    that claims stop_reason=tool_use but carries no tool_use block. Narrower than is_bad —
+    used to detect poison buried *before* the leaf, where a plain API-error line must NOT
+    trigger a false mid-conversation abort."""
+    if d is None:
+        return False
+    msg = d.get("message") or {}
+    typ = d.get("type")
+    content = msg.get("content")
+    if typ == "user" and d.get("isMeta"):
+        if isinstance(content, str):
+            txt = content
+        elif isinstance(content, list):
+            txt = " ".join(b.get("text", "") for b in content if isinstance(b, dict))
+        else:
+            txt = ""
+        if RETRY_HINT in txt:
+            return True
+    if typ == "assistant" and msg.get("stop_reason") == "tool_use":
+        blocks = content if isinstance(content, list) else []
+        if not any(isinstance(b, dict) and b.get("type") == "tool_use" for b in blocks):
+            return True
+    return False
 
 
 def is_bad(d):
@@ -74,17 +112,7 @@ def is_bad(d):
     msg = d.get("message") or {}
     if msg.get("model") == "<synthetic>" or d.get("isApiErrorMessage"):
         return True
-    typ = d.get("type")
-    content = msg.get("content")
-    if typ == "user" and d.get("isMeta"):
-        txt = content if isinstance(content, str) else ""
-        if RETRY_HINT in (txt or ""):
-            return True
-    if typ == "assistant" and msg.get("stop_reason") == "tool_use":
-        blocks = content if isinstance(content, list) else []
-        if not any(b.get("type") == "tool_use" for b in blocks):
-            return True
-    return False
+    return is_poison(d)
 
 
 def is_clean_leaf(d):
@@ -98,7 +126,12 @@ def is_clean_leaf(d):
     if typ == "user" and not d.get("isMeta"):
         return True
     if typ == "assistant" and msg.get("stop_reason") in {"end_turn", "stop_sequence"}:
-        return msg.get("model") != "<synthetic>"
+        if msg.get("model") == "<synthetic>":
+            return False
+        blocks = msg.get("content") if isinstance(msg.get("content"), list) else []
+        if any(isinstance(b, dict) and b.get("type") == "tool_use" for b in blocks):
+            return False
+        return True
     return False
 
 
@@ -140,7 +173,8 @@ def main():
     args = ap.parse_args()
 
     path = resolve_session(args.session)
-    recs = parse_lines(path)
+    raw = path.read_text(encoding="utf-8")
+    recs = parse_lines(raw)
 
     conv_idx = [i for i, d in enumerate(recs) if d and d.get("type") in CONV_TYPES]
     if not conv_idx:
@@ -164,6 +198,13 @@ def main():
     if leaf_pos is None:
         sys.exit("no clean leaf found (whole tail is bad?) — use /compact instead.")
 
+    buried = next((i for i in conv_idx if i < leaf_pos and is_poison(recs[i])), None)
+    if buried is not None:
+        sys.exit(
+            f"{path.name}: poison at L{buried + 1} is buried before the last clean turn "
+            f"(L{leaf_pos + 1}); tail truncation can't remove it — use /compact instead."
+        )
+
     keep = leaf_pos + 1
     dropped = len(recs) - keep
     sid = path.stem
@@ -177,11 +218,17 @@ def main():
         return
 
     bak = path.with_suffix(f".jsonl.bak.{int(time.time())}")
-    bak.write_text(path.read_text())
-    lines = path.read_text().splitlines()
-    path.write_text("\n".join(lines[:keep]) + "\n")
-    print(f"\ntruncated. backup: {bak}")
+    bak.write_text(raw, encoding="utf-8")
+    print(f"\nbackup   : {bak}")
     print(f"restore  : cp '{bak}' '{path}'")
+    lines = raw.split("\n")
+    tmp = path.with_suffix(f".jsonl.tmp.{os.getpid()}")
+    with tmp.open("w", encoding="utf-8") as f:
+        f.write("\n".join(lines[:keep]) + "\n")
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+    print("truncated.")
 
     orig = session_cwd(recs)
     if args.resume:
