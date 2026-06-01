@@ -217,13 +217,6 @@ def main():
     if leaf_pos is None:
         sys.exit("no clean leaf found (whole tail is bad?) — use /compact instead.")
 
-    buried = next((i for i in conv_idx if i < leaf_pos and is_poison(recs[i], poison_ids)), None)
-    if buried is not None:
-        sys.exit(
-            f"{path.name}: poison at L{buried + 1} is buried before the last clean turn "
-            f"(L{leaf_pos + 1}); tail truncation can't remove it — use /compact instead."
-        )
-
     keep = leaf_pos + 1
     dropped = len(recs) - keep
     sid = path.stem

@@ -94,10 +94,12 @@ where you invoked the command.
 
 ## Limitations
 
-- Handles **tail** cascades (the common case). If the poison is buried mid-conversation
-  with good content after it, splicing + re-linking the `parentUuid` chain is required —
-  use `/compact` instead. The tool detects this — either "no clean leaf" or poison buried
-  before the last clean turn — and stops with that hint instead of silently truncating.
+- Handles **tail** cascades (the common case): the run of bad turns at the very end.
+  Earlier poison turns the session already recovered from — clean turns follow them, so a
+  malformed call there was retried successfully and is harmless history — are left untouched;
+  resuming past the tail is enough. (Long sessions accumulate several of these via few-shot
+  self-poisoning; that's normal.) The only unrecoverable case is when the *whole* tail is bad
+  with no clean leaf to rewind to — the tool detects that and tells you to use `/compact`.
 - Resume reconstruction is **Claude Code version-specific**. The truncated output is
   validated as well-formed JSON, but verify your first run with `ccfix` (no `-r`) and a
   manual `claude --resume` before trusting `-r`.
