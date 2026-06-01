@@ -96,7 +96,8 @@ where you invoked the command.
 
 - Handles **tail** cascades (the common case). If the poison is buried mid-conversation
   with good content after it, splicing + re-linking the `parentUuid` chain is required —
-  use `/compact` instead. The tool detects "no clean leaf" and tells you so.
+  use `/compact` instead. The tool detects this — either "no clean leaf" or poison buried
+  before the last clean turn — and stops with that hint instead of silently truncating.
 - Resume reconstruction is **Claude Code version-specific**. The truncated output is
   validated as well-formed JSON, but verify your first run with `ccfix` (no `-r`) and a
   manual `claude --resume` before trusting `-r`.
